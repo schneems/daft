@@ -22,6 +22,10 @@ struct ErrorParty {
 }
 
 impl ErrorParty {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
     pub(crate) fn push(&mut self, error: syn::Error) {
         self.errors.push_back(error);
     }
@@ -575,42 +579,43 @@ impl DiffFields {
         f: &Field,
         errors: ErrorSink<'_, syn::Error>,
     ) -> Option<(Field, FieldConfig)> {
-        let Some(config) =
-            FieldConfig::parse_from(&f.attrs, errors.new_child())
-        else {
-            // None means there's an error parsing a config -- return None here,
-            // we'll emit errors at the top level.
-            return None;
-        };
-        if config.mode == FieldMode::Ignore {
-            // Skip over this field if there's an ignore.
-            return None;
+        match FieldConfig::parse_from(&f.attrs, errors.new_child()) {
+            Ok(config) => {
+                if config.mode == FieldMode::Ignore {
+                    // Skip over this field if there's an ignore.
+                    return None;
+                }
+
+                // Always use the daft lifetime for the diff -- associations between the
+                // daft lifetime and existing parameters (both lifetime and type
+                // parameters) are created in `add_lifetime_to_generics`, e.g. `'a:
+                // '__daft`, or `T: '__daft`.
+                let lt = daft_lifetime();
+                let daft_crate = daft_crate();
+                let ty = &f.ty;
+                let mut f = f.clone();
+
+                f.ty = if config.mode == FieldMode::Leaf {
+                    parse_quote_spanned! {f.span()=>
+                        #daft_crate::Leaf<&#lt #ty>
+                    }
+                } else {
+                    parse_quote_spanned! {f.span()=>
+                        <#ty as #daft_crate::Diffable>::Diff<#lt>
+                    }
+                };
+
+                // Drop all attributes for now. We may want to carry some over in the
+                // future.
+                f.attrs = vec![];
+
+                Some((f, config))
+            }
+            Err(error) => {
+                errors.new_child().push(error);
+                None
+            }
         }
-
-        // Always use the daft lifetime for the diff -- associations between the
-        // daft lifetime and existing parameters (both lifetime and type
-        // parameters) are created in `add_lifetime_to_generics`, e.g. `'a:
-        // '__daft`, or `T: '__daft`.
-        let lt = daft_lifetime();
-        let daft_crate = daft_crate();
-        let ty = &f.ty;
-        let mut f = f.clone();
-
-        f.ty = if config.mode == FieldMode::Leaf {
-            parse_quote_spanned! {f.span()=>
-                #daft_crate::Leaf<&#lt #ty>
-            }
-        } else {
-            parse_quote_spanned! {f.span()=>
-                <#ty as #daft_crate::Diffable>::Diff<#lt>
-            }
-        };
-
-        // Drop all attributes for now. We may want to carry some over in the
-        // future.
-        f.attrs = vec![];
-
-        Some((f, config))
     }
 
     /// Returns an iterator over field types.
@@ -748,8 +753,9 @@ struct FieldConfig {
 impl FieldConfig {
     fn parse_from(
         attrs: &[Attribute],
-        errors: ErrorSink<'_, syn::Error>,
-    ) -> Option<Self> {
+        _errors: ErrorSink<'_, syn::Error>,
+    ) -> Result<Self, syn::Error> {
+        let mut errors = ErrorParty::new();
         let mut mode = FieldMode::Default;
 
         for attr in attrs {
@@ -807,10 +813,10 @@ impl FieldConfig {
             }
         }
 
-        if errors.has_errors() {
-            None
+        if let Some(error) = errors.to_syn() {
+            Err(error)
         } else {
-            Some(Self { mode })
+            Ok(Self { mode })
         }
     }
 }
