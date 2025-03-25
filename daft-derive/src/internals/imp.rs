@@ -1,5 +1,4 @@
-use std::collections::VecDeque;
-
+use super::error_store::ErrorStore;
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, quote_spanned, ToTokens};
 use syn::{
@@ -8,42 +7,6 @@ use syn::{
     Fields, GenericParam, Generics, Index, Lifetime, LifetimeParam, Path,
     Token, WhereClause, WherePredicate,
 };
-
-#[derive(Debug, Default)]
-struct ErrorParty {
-    errors: VecDeque<syn::Error>,
-}
-
-impl IntoIterator for ErrorParty {
-    type Item = syn::Error;
-    type IntoIter = <VecDeque<syn::Error> as IntoIterator>::IntoIter;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.errors.into_iter()
-    }
-}
-
-impl ErrorParty {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    pub(crate) fn push(&mut self, error: syn::Error) {
-        self.errors.push_back(error);
-    }
-
-    pub(crate) fn first_to_syn(self) -> Option<syn::Error> {
-        let mut errors = self.errors;
-        if let Some(mut error) = errors.pop_front() {
-            for e in errors {
-                error.combine(e);
-            }
-            Some(error)
-        } else {
-            None
-        }
-    }
-}
 
 pub struct DeriveDiffableOutput {
     pub out: Option<TokenStream>,
@@ -68,15 +31,12 @@ pub fn derive_diffable(input: syn::DeriveInput) -> DeriveDiffableOutput {
             }
         }
         Data::Struct(s) => match make_struct_impl(&input, s) {
-            (None, None) => DeriveDiffableOutput {
-                out: None,
-                errors: vec![syn::Error::new(
-                    Span::call_site(),
-                    "Internal daft error, no code and no errors produced",
-                )],
+            Ok((out, errors)) => DeriveDiffableOutput {
+                out: out.into(),
+                errors: errors.into_iter().collect(),
             },
-            (out, errors) => DeriveDiffableOutput {
-                out,
+            Err(errors) => DeriveDiffableOutput {
+                out: None,
                 errors: errors.into_iter().collect(),
             },
         },
@@ -128,7 +88,7 @@ fn make_leaf(
     input: &DeriveInput,
     position: AttrPosition,
 ) -> (TokenStream, Option<syn::Error>) {
-    let mut warnings = ErrorParty::new();
+    let mut warnings = ErrorStore::new();
     // The input should not have any daft attributes.
     for attr in &input.attrs {
         if attr.path().is_ident("daft") {
@@ -160,7 +120,7 @@ fn make_leaf(
     }
 
     // Variants should not have any daft attributes.
-    let mut v = BanDaftAttrsVisitor { position, errors: ErrorParty::new() };
+    let mut v = BanDaftAttrsVisitor { position, errors: ErrorStore::new() };
     v.visit_data(&input.data);
     if let Some(error) = v.errors.first_to_syn() {
         warnings.push(error);
@@ -196,7 +156,7 @@ fn make_leaf(
 
 struct BanDaftAttrsVisitor {
     position: AttrPosition,
-    errors: ErrorParty,
+    errors: ErrorStore,
 }
 
 impl Visit<'_> for BanDaftAttrsVisitor {
@@ -304,7 +264,7 @@ impl AttrPosition {
 fn make_struct_impl(
     input: &DeriveInput,
     s: &DataStruct,
-) -> (Option<TokenStream>, Option<syn::Error>) {
+) -> Result<(TokenStream, Option<syn::Error>), syn::Error> {
     match StructConfig::parse_from(&input.attrs).map(|config| config.mode) {
         Ok(StructMode::Default) => {
             match make_diff_struct(input, s).map(
@@ -319,15 +279,15 @@ fn make_struct_impl(
                     }
                 },
             ) {
-                Ok(stream) => (Some(stream), None),
-                Err(error) => (None, Some(error)),
+                Ok(stream) => Ok((stream, None)),
+                Err(error) => Err(error),
             }
         }
         Ok(StructMode::Leaf) => {
             let (out, error) = make_leaf(input, AttrPosition::LeafStruct);
-            (Some(out), error)
+            Ok((out, error))
         }
-        Err(error) => (None, Some(error)),
+        Err(error) => Err(error),
     }
 }
 
@@ -525,7 +485,7 @@ impl DiffFields {
         fields: &Fields,
         where_clause: Option<&WhereClause>,
     ) -> Result<Self, syn::Error> {
-        let mut errors = ErrorParty::new();
+        let mut errors = ErrorStore::new();
         let (fields, field_configs) = match fields {
             Fields::Named(fields) => {
                 let mut field_config = Vec::new();
@@ -701,7 +661,7 @@ struct StructConfig {
 impl StructConfig {
     fn parse_from(attrs: &[Attribute]) -> Result<Self, syn::Error> {
         let mut mode = StructMode::Default;
-        let mut errors = ErrorParty::default();
+        let mut errors = ErrorStore::default();
 
         for attr in attrs {
             {
@@ -758,7 +718,7 @@ struct FieldConfig {
 
 impl FieldConfig {
     fn parse_from(attrs: &[Attribute]) -> Result<Self, syn::Error> {
-        let mut errors = ErrorParty::new();
+        let mut errors = ErrorStore::new();
         let mut mode = FieldMode::Default;
 
         for attr in attrs {
