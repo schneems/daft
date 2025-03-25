@@ -1,4 +1,4 @@
-use super::error_store::{ErrorSink, ErrorStore};
+use super::error_store::ErrorStore;
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, quote_spanned, ToTokens};
 use syn::{
@@ -21,30 +21,32 @@ impl ToTokens for DeriveDiffableOutput {
 }
 
 pub fn derive_diffable(input: syn::DeriveInput) -> DeriveDiffableOutput {
-    let mut error_store = ErrorStore::new();
-
     match &input.data {
         Data::Enum(_) => {
             // Implement all Enums as `Leaf`s
-            let out = make_leaf(&input, AttrPosition::Enum, error_store.sink());
+            let (out, errors) = make_leaf(&input, AttrPosition::Enum);
             DeriveDiffableOutput {
                 out: Some(out),
-                errors: error_store.into_inner(),
+                errors: errors.into_iter().collect(),
             }
         }
-        Data::Struct(s) => {
-            // This might be None if there are errors.
-            let out = make_struct_impl(&input, s, error_store.sink());
-            DeriveDiffableOutput { out, errors: error_store.into_inner() }
-        }
+        Data::Struct(s) => match make_struct_impl(&input, s) {
+            Ok((out, errors)) => DeriveDiffableOutput {
+                out: out.into(),
+                errors: errors.into_iter().collect(),
+            },
+            Err(errors) => DeriveDiffableOutput {
+                out: None,
+                errors: errors.into_iter().collect(),
+            },
+        },
 
         Data::Union(_) => {
             // Implement all unions as `Leaf`s
-            let out =
-                make_leaf(&input, AttrPosition::Union, error_store.sink());
+            let (out, errors) = make_leaf(&input, AttrPosition::Union);
             DeriveDiffableOutput {
                 out: Some(out),
-                errors: error_store.into_inner(),
+                errors: errors.into_iter().collect(),
             }
         }
     }
@@ -85,8 +87,8 @@ fn add_lifetime_to_generics(
 fn make_leaf(
     input: &DeriveInput,
     position: AttrPosition,
-    errors: ErrorSink<'_, syn::Error>,
-) -> TokenStream {
+) -> (TokenStream, Option<syn::Error>) {
+    let mut warnings = ErrorStore::new();
     // The input should not have any daft attributes.
     for attr in &input.attrs {
         if attr.path().is_ident("daft") {
@@ -97,13 +99,13 @@ fn make_leaf(
                         return Ok(());
                     }
 
-                    errors.push(meta.error(format!(
+                    warnings.push(meta.error(format!(
                         "this is unnecessary: the Diffable \
                          implementation {} is always a leaf",
                         position.as_purpose_str(),
                     )));
                 } else {
-                    errors.push(meta.error(format!(
+                    warnings.push(meta.error(format!(
                         "daft attributes are not allowed {}",
                         position.as_locative_str(),
                     )));
@@ -112,14 +114,17 @@ fn make_leaf(
                 Ok(())
             });
             if let Err(err) = res {
-                errors.push(err);
+                warnings.push(err);
             }
         }
     }
 
     // Variants should not have any daft attributes.
-    let mut v = BanDaftAttrsVisitor { position, errors: errors.new_child() };
+    let mut v = BanDaftAttrsVisitor { position, errors: ErrorStore::new() };
     v.visit_data(&input.data);
+    if let Some(error) = v.errors.first_to_syn() {
+        warnings.push(error);
+    }
 
     // Even though errors might have occurred above, we *do* generate the
     // implementation. That allows rust-analyzer to still understand that the
@@ -134,24 +139,27 @@ fn make_leaf(
     // `add_lifetime_to_generics`.
     let (impl_gen, ty_gen, where_clause) = &input.generics.split_for_impl();
 
-    quote! {
-        impl #impl_gen #daft_crate::Diffable for #ident #ty_gen #where_clause
-        {
-            type Diff<#daft_lt> = #daft_crate::Leaf<&#daft_lt Self> where Self: #daft_lt;
+    (
+        quote! {
+            impl #impl_gen #daft_crate::Diffable for #ident #ty_gen #where_clause
+            {
+                type Diff<#daft_lt> = #daft_crate::Leaf<&#daft_lt Self> where Self: #daft_lt;
 
-            fn diff<#daft_lt>(&#daft_lt self, other: &#daft_lt Self) -> Self::Diff<#daft_lt> {
-                #daft_crate::Leaf {before: self, after: other}
+                fn diff<#daft_lt>(&#daft_lt self, other: &#daft_lt Self) -> Self::Diff<#daft_lt> {
+                    #daft_crate::Leaf {before: self, after: other}
+                }
             }
-        }
-    }
+        },
+        warnings.first_to_syn(),
+    )
 }
 
-struct BanDaftAttrsVisitor<'a> {
+struct BanDaftAttrsVisitor {
     position: AttrPosition,
-    errors: ErrorSink<'a, syn::Error>,
+    errors: ErrorStore,
 }
 
-impl Visit<'_> for BanDaftAttrsVisitor<'_> {
+impl Visit<'_> for BanDaftAttrsVisitor {
     fn visit_attribute(&mut self, attr: &Attribute) {
         if attr.path().is_ident("daft") {
             self.errors.push(syn::Error::new_spanned(
@@ -256,31 +264,30 @@ impl AttrPosition {
 fn make_struct_impl(
     input: &DeriveInput,
     s: &DataStruct,
-    errors: ErrorSink<'_, syn::Error>,
-) -> Option<TokenStream> {
-    let Some(struct_config) =
-        StructConfig::parse_from(&input.attrs, errors.new_child())
-    else {
-        // An error occurred parsing the struct configuration -- don't generate
-        // anything.
-        return None;
-    };
-
-    match struct_config.mode {
-        StructMode::Default => make_diff_struct(input, s, errors.new_child())
-            .map(|(generated_struct, diff_fields)| {
-                let diff_impl = make_diff_impl(input, &diff_fields);
-                // Uncomment for some debugging
-                // eprintln!("{generated_struct}");
-                // eprintln!("{diff_impl}");
-                quote! {
-                    #generated_struct
-                    #diff_impl
-                }
-            }),
-        StructMode::Leaf => {
-            Some(make_leaf(input, AttrPosition::LeafStruct, errors.new_child()))
+) -> Result<(TokenStream, Option<syn::Error>), syn::Error> {
+    match StructConfig::parse_from(&input.attrs).map(|config| config.mode) {
+        Ok(StructMode::Default) => {
+            match make_diff_struct(input, s).map(
+                |(generated_struct, diff_fields)| {
+                    let diff_impl = make_diff_impl(input, &diff_fields);
+                    // Uncomment for some debugging
+                    // eprintln!("{generated_struct}");
+                    // eprintln!("{diff_impl}");
+                    quote! {
+                        #generated_struct
+                        #diff_impl
+                    }
+                },
+            ) {
+                Ok(stream) => Ok((stream, None)),
+                Err(error) => Err(error),
+            }
         }
+        Ok(StructMode::Leaf) => {
+            let (out, error) = make_leaf(input, AttrPosition::LeafStruct);
+            Ok((out, error))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -288,8 +295,7 @@ fn make_struct_impl(
 fn make_diff_struct(
     input: &DeriveInput,
     s: &DataStruct,
-    errors: ErrorSink<'_, syn::Error>,
-) -> Option<(TokenStream, DiffFields)> {
+) -> Result<(TokenStream, DiffFields), syn::Error> {
     // The name of the original type
     let vis = &input.vis;
 
@@ -315,12 +321,7 @@ fn make_diff_struct(
     let new_generics = add_lifetime_to_generics(input, &daft_lt);
     let where_clause = &new_generics.where_clause;
 
-    let Some(diff_fields) =
-        DiffFields::new(&s.fields, where_clause.as_ref(), errors.new_child())
-    else {
-        // An error occurred parsing fields -- don't generate the diff struct.
-        return None;
-    };
+    let diff_fields = DiffFields::new(&s.fields, where_clause.as_ref())?;
 
     // --- No more errors past this point ---
 
@@ -417,7 +418,7 @@ fn make_diff_struct(
         }
     };
 
-    Some((
+    Ok((
         quote! {
             #struct_def
             #debug_impl
@@ -483,17 +484,23 @@ impl DiffFields {
     fn new(
         fields: &Fields,
         where_clause: Option<&WhereClause>,
-        errors: ErrorSink<'_, syn::Error>,
-    ) -> Option<Self> {
+    ) -> Result<Self, syn::Error> {
+        let mut errors = ErrorStore::new();
         let (fields, field_configs) = match fields {
             Fields::Named(fields) => {
-                let (named, configs) = fields
-                    .named
-                    .iter()
-                    .filter_map(|field| {
-                        Self::diff_field(field, errors.new_child())
-                    })
-                    .unzip();
+                let mut field_config = Vec::new();
+                for result in fields.named.iter().map(Self::diff_field) {
+                    match result {
+                        Ok(Some((field, configs))) => {
+                            field_config.push((field, configs));
+                        }
+                        Ok(None) => (),
+                        Err(error) => {
+                            errors.push(error);
+                        }
+                    }
+                }
+                let (named, configs) = field_config.into_iter().unzip();
                 (
                     Fields::Named(syn::FieldsNamed {
                         brace_token: fields.brace_token,
@@ -503,13 +510,19 @@ impl DiffFields {
                 )
             }
             Fields::Unnamed(fields) => {
-                let (unnamed, configs) = fields
-                    .unnamed
-                    .iter()
-                    .filter_map(|field| {
-                        Self::diff_field(field, errors.new_child())
-                    })
-                    .unzip();
+                let mut field_config = Vec::new();
+                for result in fields.unnamed.iter().map(Self::diff_field) {
+                    match result {
+                        Ok(Some((field, configs))) => {
+                            field_config.push((field, configs));
+                        }
+                        Ok(None) => (),
+                        Err(error) => {
+                            errors.push(error);
+                        }
+                    }
+                }
+                let (unnamed, configs) = field_config.into_iter().unzip();
                 (
                     Fields::Unnamed(syn::FieldsUnnamed {
                         paren_token: fields.paren_token,
@@ -528,10 +541,10 @@ impl DiffFields {
                 predicates: Default::default(),
             });
 
-        if errors.has_errors() {
-            None
+        if let Some(error) = errors.first_to_syn() {
+            Err(error)
         } else {
-            Some(Self { fields, field_configs, where_clause })
+            Ok(Self { fields, field_configs, where_clause })
         }
     }
 
@@ -541,18 +554,11 @@ impl DiffFields {
     /// return None.
     fn diff_field(
         f: &Field,
-        errors: ErrorSink<'_, syn::Error>,
-    ) -> Option<(Field, FieldConfig)> {
-        let Some(config) =
-            FieldConfig::parse_from(&f.attrs, errors.new_child())
-        else {
-            // None means there's an error parsing a config -- return None here,
-            // we'll emit errors at the top level.
-            return None;
-        };
+    ) -> Result<Option<(Field, FieldConfig)>, syn::Error> {
+        let config = FieldConfig::parse_from(&f.attrs)?;
         if config.mode == FieldMode::Ignore {
             // Skip over this field if there's an ignore.
-            return None;
+            return Ok(None);
         }
 
         // Always use the daft lifetime for the diff -- associations between the
@@ -578,7 +584,7 @@ impl DiffFields {
         // future.
         f.attrs = vec![];
 
-        Some((f, config))
+        Ok(Some((f, config)))
     }
 
     /// Returns an iterator over field types.
@@ -653,11 +659,9 @@ struct StructConfig {
 }
 
 impl StructConfig {
-    fn parse_from(
-        attrs: &[Attribute],
-        errors: ErrorSink<'_, syn::Error>,
-    ) -> Option<Self> {
+    fn parse_from(attrs: &[Attribute]) -> Result<Self, syn::Error> {
         let mut mode = StructMode::Default;
+        let mut errors = ErrorStore::default();
 
         for attr in attrs {
             {
@@ -691,10 +695,10 @@ impl StructConfig {
             }
         }
 
-        if errors.has_errors() {
-            None
+        if let Some(error) = errors.first_to_syn() {
+            Err(error)
         } else {
-            Some(Self { mode })
+            Ok(Self { mode })
         }
     }
 }
@@ -713,10 +717,8 @@ struct FieldConfig {
 }
 
 impl FieldConfig {
-    fn parse_from(
-        attrs: &[Attribute],
-        errors: ErrorSink<'_, syn::Error>,
-    ) -> Option<Self> {
+    fn parse_from(attrs: &[Attribute]) -> Result<Self, syn::Error> {
+        let mut errors = ErrorStore::new();
         let mut mode = FieldMode::Default;
 
         for attr in attrs {
@@ -774,10 +776,10 @@ impl FieldConfig {
             }
         }
 
-        if errors.has_errors() {
-            None
+        if let Some(error) = errors.first_to_syn() {
+            Err(error)
         } else {
-            Some(Self { mode })
+            Ok(Self { mode })
         }
     }
 }
