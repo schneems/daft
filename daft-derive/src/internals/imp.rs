@@ -292,7 +292,7 @@ fn make_struct_impl(
 ) -> Option<TokenStream> {
     match StructConfig::parse_from(&input.attrs).map(|config| config.mode) {
         Ok(StructMode::Default) => {
-            make_diff_struct(input, s, errors.new_child()).map(
+            match make_diff_struct(input, s).map(
                 |(generated_struct, diff_fields)| {
                     let diff_impl = make_diff_impl(input, &diff_fields);
                     // Uncomment for some debugging
@@ -303,7 +303,13 @@ fn make_struct_impl(
                         #diff_impl
                     }
                 },
-            )
+            ) {
+                Ok(stream) => Some(stream),
+                Err(error) => {
+                    errors.new_child().push(error);
+                    None
+                }
+            }
         }
         Ok(StructMode::Leaf) => {
             Some(make_leaf(input, AttrPosition::LeafStruct, errors.new_child()))
@@ -319,8 +325,7 @@ fn make_struct_impl(
 fn make_diff_struct(
     input: &DeriveInput,
     s: &DataStruct,
-    errors: ErrorSink<'_, syn::Error>,
-) -> Option<(TokenStream, DiffFields)> {
+) -> Result<(TokenStream, DiffFields), syn::Error> {
     // The name of the original type
     let vis = &input.vis;
 
@@ -346,13 +351,7 @@ fn make_diff_struct(
     let new_generics = add_lifetime_to_generics(input, &daft_lt);
     let where_clause = &new_generics.where_clause;
 
-    let diff_fields = match DiffFields::new(&s.fields, where_clause.as_ref()) {
-        Ok(diff_fields) => diff_fields,
-        Err(error) => {
-            errors.new_child().push(error);
-            return None;
-        }
-    };
+    let diff_fields = DiffFields::new(&s.fields, where_clause.as_ref())?;
 
     // --- No more errors past this point ---
 
@@ -449,7 +448,7 @@ fn make_diff_struct(
         }
     };
 
-    Some((
+    Ok((
         quote! {
             #struct_def
             #debug_impl
