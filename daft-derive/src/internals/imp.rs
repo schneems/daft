@@ -10,12 +10,6 @@ use syn::{
     Token, WhereClause, WherePredicate,
 };
 
-#[derive(Debug)]
-enum ResultWarn<T, W> {
-    Ok(T),
-    OkWarn(T, W),
-}
-
 #[derive(Debug, Default)]
 struct ErrorParty {
     errors: VecDeque<syn::Error>,
@@ -153,8 +147,11 @@ fn make_leaf(
     }
 
     // Variants should not have any daft attributes.
-    let mut v = BanDaftAttrsVisitor { position, errors: errors.new_child() };
+    let mut v = BanDaftAttrsVisitor { position, errors: ErrorParty::new() };
     v.visit_data(&input.data);
+    if let Some(error) = v.errors.first_to_syn() {
+        errors.push(error);
+    }
 
     // Even though errors might have occurred above, we *do* generate the
     // implementation. That allows rust-analyzer to still understand that the
@@ -181,12 +178,12 @@ fn make_leaf(
     }
 }
 
-struct BanDaftAttrsVisitor<'a> {
+struct BanDaftAttrsVisitor {
     position: AttrPosition,
-    errors: ErrorSink<'a, syn::Error>,
+    errors: ErrorParty,
 }
 
-impl Visit<'_> for BanDaftAttrsVisitor<'_> {
+impl Visit<'_> for BanDaftAttrsVisitor {
     fn visit_attribute(&mut self, attr: &Attribute) {
         if attr.path().is_ident("daft") {
             self.errors.push(syn::Error::new_spanned(

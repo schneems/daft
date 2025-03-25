@@ -72,13 +72,6 @@ impl<'a, T> ErrorSink<'a, T> {
         self.data.borrow_mut().push(self.id, error);
     }
 
-    pub(crate) fn has_errors(&self) -> bool {
-        // ErrorStore::push_error propagates has_errors up the tree while
-        // writing errors, so we can just check the current ID while reading
-        // this information.
-        self.data.borrow().sinks[self.id].has_errors
-    }
-
     pub(crate) fn new_child(&self) -> ErrorSink<'a, T> {
         let mut errors = self.data.borrow_mut();
         let new_id = errors.register_sink(Some(self.id));
