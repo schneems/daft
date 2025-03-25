@@ -293,9 +293,7 @@ fn make_struct_impl(
     s: &DataStruct,
     errors: ErrorSink<'_, syn::Error>,
 ) -> Option<TokenStream> {
-    match StructConfig::parse_from(&input.attrs, errors.new_child())
-        .map(|config| config.mode)
-    {
+    match StructConfig::parse_from(&input.attrs).map(|config| config.mode) {
         Ok(StructMode::Default) => {
             make_diff_struct(input, s, errors.new_child()).map(
                 |(generated_struct, diff_fields)| {
@@ -351,11 +349,7 @@ fn make_diff_struct(
     let new_generics = add_lifetime_to_generics(input, &daft_lt);
     let where_clause = &new_generics.where_clause;
 
-    let diff_fields = match DiffFields::new(
-        &s.fields,
-        where_clause.as_ref(),
-        errors.new_child(),
-    ) {
+    let diff_fields = match DiffFields::new(&s.fields, where_clause.as_ref()) {
         Ok(diff_fields) => diff_fields,
         Err(error) => {
             errors.new_child().push(error);
@@ -524,7 +518,6 @@ impl DiffFields {
     fn new(
         fields: &Fields,
         where_clause: Option<&WhereClause>,
-        _errors: ErrorSink<'_, syn::Error>,
     ) -> Result<Self, syn::Error> {
         let mut errors = ErrorParty::new();
         let (fields, field_configs) = match fields {
@@ -700,10 +693,7 @@ struct StructConfig {
 }
 
 impl StructConfig {
-    fn parse_from(
-        attrs: &[Attribute],
-        _errors: ErrorSink<'_, syn::Error>,
-    ) -> Result<Self, syn::Error> {
+    fn parse_from(attrs: &[Attribute]) -> Result<Self, syn::Error> {
         let mut mode = StructMode::Default;
         let mut errors = ErrorParty::default();
 
