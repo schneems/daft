@@ -30,7 +30,7 @@ impl ErrorParty {
         self.errors.push_back(error);
     }
 
-    pub(crate) fn to_syn(self) -> Option<syn::Error> {
+    pub(crate) fn first_to_syn(self) -> Option<syn::Error> {
         let mut errors = self.errors;
         if let Some(mut error) = errors.pop_front() {
             for e in errors {
@@ -519,17 +519,24 @@ impl DiffFields {
     fn new(
         fields: &Fields,
         where_clause: Option<&WhereClause>,
-        errors: ErrorSink<'_, syn::Error>,
+        _errors: ErrorSink<'_, syn::Error>,
     ) -> Option<Self> {
+        let mut errors = ErrorParty::new();
         let (fields, field_configs) = match fields {
             Fields::Named(fields) => {
-                let (named, configs) = fields
-                    .named
-                    .iter()
-                    .filter_map(|field| {
-                        Self::diff_field(field, errors.new_child())
-                    })
-                    .unzip();
+                let mut field_config = Vec::new();
+                for result in fields.named.iter().map(Self::diff_field) {
+                    match result {
+                        Ok(Some((field, configs))) => {
+                            field_config.push((field, configs));
+                        }
+                        Ok(None) => (),
+                        Err(error) => {
+                            errors.push(error);
+                        }
+                    }
+                }
+                let (named, configs) = field_config.into_iter().unzip();
                 (
                     Fields::Named(syn::FieldsNamed {
                         brace_token: fields.brace_token,
@@ -539,13 +546,19 @@ impl DiffFields {
                 )
             }
             Fields::Unnamed(fields) => {
-                let (unnamed, configs) = fields
-                    .unnamed
-                    .iter()
-                    .filter_map(|field| {
-                        Self::diff_field(field, errors.new_child())
-                    })
-                    .unzip();
+                let mut field_config = Vec::new();
+                for result in fields.unnamed.iter().map(Self::diff_field) {
+                    match result {
+                        Ok(Some((field, configs))) => {
+                            field_config.push((field, configs));
+                        }
+                        Ok(None) => (),
+                        Err(error) => {
+                            errors.push(error);
+                        }
+                    }
+                }
+                let (unnamed, configs) = field_config.into_iter().unzip();
                 (
                     Fields::Unnamed(syn::FieldsUnnamed {
                         paren_token: fields.paren_token,
@@ -564,7 +577,8 @@ impl DiffFields {
                 predicates: Default::default(),
             });
 
-        if errors.has_errors() {
+        if let Some(error) = errors.first_to_syn() {
+            _errors.push(error);
             None
         } else {
             Some(Self { fields, field_configs, where_clause })
@@ -577,45 +591,37 @@ impl DiffFields {
     /// return None.
     fn diff_field(
         f: &Field,
-        errors: ErrorSink<'_, syn::Error>,
-    ) -> Option<(Field, FieldConfig)> {
-        match FieldConfig::parse_from(&f.attrs, errors.new_child()) {
-            Ok(config) => {
-                if config.mode == FieldMode::Ignore {
-                    // Skip over this field if there's an ignore.
-                    return None;
-                }
-
-                // Always use the daft lifetime for the diff -- associations between the
-                // daft lifetime and existing parameters (both lifetime and type
-                // parameters) are created in `add_lifetime_to_generics`, e.g. `'a:
-                // '__daft`, or `T: '__daft`.
-                let lt = daft_lifetime();
-                let daft_crate = daft_crate();
-                let ty = &f.ty;
-                let mut f = f.clone();
-
-                f.ty = if config.mode == FieldMode::Leaf {
-                    parse_quote_spanned! {f.span()=>
-                        #daft_crate::Leaf<&#lt #ty>
-                    }
-                } else {
-                    parse_quote_spanned! {f.span()=>
-                        <#ty as #daft_crate::Diffable>::Diff<#lt>
-                    }
-                };
-
-                // Drop all attributes for now. We may want to carry some over in the
-                // future.
-                f.attrs = vec![];
-
-                Some((f, config))
-            }
-            Err(error) => {
-                errors.new_child().push(error);
-                None
-            }
+    ) -> Result<Option<(Field, FieldConfig)>, syn::Error> {
+        let config = FieldConfig::parse_from(&f.attrs)?;
+        if config.mode == FieldMode::Ignore {
+            // Skip over this field if there's an ignore.
+            return Ok(None);
         }
+
+        // Always use the daft lifetime for the diff -- associations between the
+        // daft lifetime and existing parameters (both lifetime and type
+        // parameters) are created in `add_lifetime_to_generics`, e.g. `'a:
+        // '__daft`, or `T: '__daft`.
+        let lt = daft_lifetime();
+        let daft_crate = daft_crate();
+        let ty = &f.ty;
+        let mut f = f.clone();
+
+        f.ty = if config.mode == FieldMode::Leaf {
+            parse_quote_spanned! {f.span()=>
+                #daft_crate::Leaf<&#lt #ty>
+            }
+        } else {
+            parse_quote_spanned! {f.span()=>
+                <#ty as #daft_crate::Diffable>::Diff<#lt>
+            }
+        };
+
+        // Drop all attributes for now. We may want to carry some over in the
+        // future.
+        f.attrs = vec![];
+
+        Ok(Some((f, config)))
     }
 
     /// Returns an iterator over field types.
@@ -729,7 +735,7 @@ impl StructConfig {
             }
         }
 
-        if let Some(error) = errors.to_syn() {
+        if let Some(error) = errors.first_to_syn() {
             Err(error)
         } else {
             Ok(Self { mode })
@@ -751,10 +757,7 @@ struct FieldConfig {
 }
 
 impl FieldConfig {
-    fn parse_from(
-        attrs: &[Attribute],
-        _errors: ErrorSink<'_, syn::Error>,
-    ) -> Result<Self, syn::Error> {
+    fn parse_from(attrs: &[Attribute]) -> Result<Self, syn::Error> {
         let mut errors = ErrorParty::new();
         let mut mode = FieldMode::Default;
 
@@ -813,7 +816,7 @@ impl FieldConfig {
             }
         }
 
-        if let Some(error) = errors.to_syn() {
+        if let Some(error) = errors.first_to_syn() {
             Err(error)
         } else {
             Ok(Self { mode })
