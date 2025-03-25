@@ -351,11 +351,16 @@ fn make_diff_struct(
     let new_generics = add_lifetime_to_generics(input, &daft_lt);
     let where_clause = &new_generics.where_clause;
 
-    let Some(diff_fields) =
-        DiffFields::new(&s.fields, where_clause.as_ref(), errors.new_child())
-    else {
-        // An error occurred parsing fields -- don't generate the diff struct.
-        return None;
+    let diff_fields = match DiffFields::new(
+        &s.fields,
+        where_clause.as_ref(),
+        errors.new_child(),
+    ) {
+        Ok(diff_fields) => diff_fields,
+        Err(error) => {
+            errors.new_child().push(error);
+            return None;
+        }
     };
 
     // --- No more errors past this point ---
@@ -520,7 +525,7 @@ impl DiffFields {
         fields: &Fields,
         where_clause: Option<&WhereClause>,
         _errors: ErrorSink<'_, syn::Error>,
-    ) -> Option<Self> {
+    ) -> Result<Self, syn::Error> {
         let mut errors = ErrorParty::new();
         let (fields, field_configs) = match fields {
             Fields::Named(fields) => {
@@ -578,10 +583,9 @@ impl DiffFields {
             });
 
         if let Some(error) = errors.first_to_syn() {
-            _errors.push(error);
-            None
+            Err(error)
         } else {
-            Some(Self { fields, field_configs, where_clause })
+            Ok(Self { fields, field_configs, where_clause })
         }
     }
 
