@@ -15,6 +15,15 @@ struct ErrorParty {
     errors: VecDeque<syn::Error>,
 }
 
+impl IntoIterator for ErrorParty {
+    type Item = syn::Error;
+    type IntoIter = <VecDeque<syn::Error> as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.errors.into_iter()
+    }
+}
+
 impl ErrorParty {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -55,10 +64,10 @@ pub fn derive_diffable(input: syn::DeriveInput) -> DeriveDiffableOutput {
     match &input.data {
         Data::Enum(_) => {
             // Implement all Enums as `Leaf`s
-            let out = make_leaf(&input, AttrPosition::Enum, error_store.sink());
+            let (out, errors) = make_leaf(&input, AttrPosition::Enum);
             DeriveDiffableOutput {
                 out: Some(out),
-                errors: error_store.into_inner(),
+                errors: errors.into_iter().collect::<Vec<_>>(),
             }
         }
         Data::Struct(s) => {
@@ -69,11 +78,10 @@ pub fn derive_diffable(input: syn::DeriveInput) -> DeriveDiffableOutput {
 
         Data::Union(_) => {
             // Implement all unions as `Leaf`s
-            let out =
-                make_leaf(&input, AttrPosition::Union, error_store.sink());
+            let (out, errors) = make_leaf(&input, AttrPosition::Union);
             DeriveDiffableOutput {
                 out: Some(out),
-                errors: error_store.into_inner(),
+                errors: errors.into_iter().collect::<Vec<_>>(),
             }
         }
     }
@@ -114,8 +122,8 @@ fn add_lifetime_to_generics(
 fn make_leaf(
     input: &DeriveInput,
     position: AttrPosition,
-    errors: ErrorSink<'_, syn::Error>,
-) -> TokenStream {
+) -> (TokenStream, Option<syn::Error>) {
+    let mut errors = ErrorParty::new();
     // The input should not have any daft attributes.
     for attr in &input.attrs {
         if attr.path().is_ident("daft") {
@@ -166,16 +174,19 @@ fn make_leaf(
     // `add_lifetime_to_generics`.
     let (impl_gen, ty_gen, where_clause) = &input.generics.split_for_impl();
 
-    quote! {
-        impl #impl_gen #daft_crate::Diffable for #ident #ty_gen #where_clause
-        {
-            type Diff<#daft_lt> = #daft_crate::Leaf<&#daft_lt Self> where Self: #daft_lt;
+    (
+        quote! {
+            impl #impl_gen #daft_crate::Diffable for #ident #ty_gen #where_clause
+            {
+                type Diff<#daft_lt> = #daft_crate::Leaf<&#daft_lt Self> where Self: #daft_lt;
 
-            fn diff<#daft_lt>(&#daft_lt self, other: &#daft_lt Self) -> Self::Diff<#daft_lt> {
-                #daft_crate::Leaf {before: self, after: other}
+                fn diff<#daft_lt>(&#daft_lt self, other: &#daft_lt Self) -> Self::Diff<#daft_lt> {
+                    #daft_crate::Leaf {before: self, after: other}
+                }
             }
-        }
-    }
+        },
+        errors.first_to_syn(),
+    )
 }
 
 struct BanDaftAttrsVisitor {
@@ -312,7 +323,11 @@ fn make_struct_impl(
             }
         }
         Ok(StructMode::Leaf) => {
-            Some(make_leaf(input, AttrPosition::LeafStruct, errors.new_child()))
+            let (out, error) = make_leaf(input, AttrPosition::LeafStruct);
+            if let Some(error) = error {
+                errors.new_child().push(error);
+            }
+            Some(out)
         }
         Err(error) => {
             errors.new_child().push(error);
