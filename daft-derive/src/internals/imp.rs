@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use super::error_store::{ErrorSink, ErrorStore};
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, quote_spanned, ToTokens};
@@ -7,6 +9,53 @@ use syn::{
     Fields, GenericParam, Generics, Index, Lifetime, LifetimeParam, Path,
     Token, WhereClause, WherePredicate,
 };
+
+#[derive(Debug)]
+enum ResultWarn<T, W> {
+    Ok(T),
+    OkWarn(T, W),
+}
+
+trait CanErrorParty {
+    fn push_party(self, party: &mut ErrorParty);
+}
+
+impl CanErrorParty for ErrorParty {
+    fn push_party(self, party: &mut ErrorParty) {
+        if let Some(error) = self.error() {
+            party.push_syn_error(error);
+        }
+    }
+}
+
+impl CanErrorParty for syn::Error {
+    fn push_party(self, party: &mut ErrorParty) {
+        party.push_syn_error(self);
+    }
+}
+
+#[derive(Debug, Default)]
+struct ErrorParty {
+    errors: VecDeque<syn::Error>,
+}
+
+impl ErrorParty {
+    pub(crate) fn push_syn_error(&mut self, error: syn::Error) {
+        self.errors.push_back(error);
+    }
+
+    pub(crate) fn error(self) -> Option<syn::Error> {
+        let mut errors = self.errors;
+        if let Some(mut error) = errors.pop_front() {
+            for e in errors {
+                error.combine(e);
+            }
+            Some(error)
+        } else {
+            None
+        }
+    }
+}
 
 pub struct DeriveDiffableOutput {
     pub out: Option<TokenStream>,
