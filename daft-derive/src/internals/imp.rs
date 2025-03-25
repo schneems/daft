@@ -16,35 +16,17 @@ enum ResultWarn<T, W> {
     OkWarn(T, W),
 }
 
-trait CanErrorParty {
-    fn push_party(self, party: &mut ErrorParty);
-}
-
-impl CanErrorParty for ErrorParty {
-    fn push_party(self, party: &mut ErrorParty) {
-        if let Some(error) = self.error() {
-            party.push_syn_error(error);
-        }
-    }
-}
-
-impl CanErrorParty for syn::Error {
-    fn push_party(self, party: &mut ErrorParty) {
-        party.push_syn_error(self);
-    }
-}
-
 #[derive(Debug, Default)]
 struct ErrorParty {
     errors: VecDeque<syn::Error>,
 }
 
 impl ErrorParty {
-    pub(crate) fn push_syn_error(&mut self, error: syn::Error) {
+    pub(crate) fn push(&mut self, error: syn::Error) {
         self.errors.push_back(error);
     }
 
-    pub(crate) fn error(self) -> Option<syn::Error> {
+    pub(crate) fn to_syn(self) -> Option<syn::Error> {
         let mut errors = self.errors;
         if let Some(mut error) = errors.pop_front() {
             for e in errors {
@@ -307,28 +289,29 @@ fn make_struct_impl(
     s: &DataStruct,
     errors: ErrorSink<'_, syn::Error>,
 ) -> Option<TokenStream> {
-    let Some(struct_config) =
-        StructConfig::parse_from(&input.attrs, errors.new_child())
-    else {
-        // An error occurred parsing the struct configuration -- don't generate
-        // anything.
-        return None;
-    };
-
-    match struct_config.mode {
-        StructMode::Default => make_diff_struct(input, s, errors.new_child())
-            .map(|(generated_struct, diff_fields)| {
-                let diff_impl = make_diff_impl(input, &diff_fields);
-                // Uncomment for some debugging
-                // eprintln!("{generated_struct}");
-                // eprintln!("{diff_impl}");
-                quote! {
-                    #generated_struct
-                    #diff_impl
-                }
-            }),
-        StructMode::Leaf => {
+    match StructConfig::parse_from(&input.attrs, errors.new_child())
+        .map(|config| config.mode)
+    {
+        Ok(StructMode::Default) => {
+            make_diff_struct(input, s, errors.new_child()).map(
+                |(generated_struct, diff_fields)| {
+                    let diff_impl = make_diff_impl(input, &diff_fields);
+                    // Uncomment for some debugging
+                    // eprintln!("{generated_struct}");
+                    // eprintln!("{diff_impl}");
+                    quote! {
+                        #generated_struct
+                        #diff_impl
+                    }
+                },
+            )
+        }
+        Ok(StructMode::Leaf) => {
             Some(make_leaf(input, AttrPosition::LeafStruct, errors.new_child()))
+        }
+        Err(error) => {
+            errors.new_child().push(error);
+            None
         }
     }
 }
@@ -704,9 +687,10 @@ struct StructConfig {
 impl StructConfig {
     fn parse_from(
         attrs: &[Attribute],
-        errors: ErrorSink<'_, syn::Error>,
-    ) -> Option<Self> {
+        _errors: ErrorSink<'_, syn::Error>,
+    ) -> Result<Self, syn::Error> {
         let mut mode = StructMode::Default;
+        let mut errors = ErrorParty::default();
 
         for attr in attrs {
             {
@@ -740,10 +724,10 @@ impl StructConfig {
             }
         }
 
-        if errors.has_errors() {
-            None
+        if let Some(error) = errors.to_syn() {
+            Err(error)
         } else {
-            Some(Self { mode })
+            Ok(Self { mode })
         }
     }
 }
