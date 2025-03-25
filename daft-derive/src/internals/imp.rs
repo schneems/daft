@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 
-use super::error_store::{ErrorSink, ErrorStore};
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, quote_spanned, ToTokens};
 use syn::{
@@ -59,29 +58,35 @@ impl ToTokens for DeriveDiffableOutput {
 }
 
 pub fn derive_diffable(input: syn::DeriveInput) -> DeriveDiffableOutput {
-    let mut error_store = ErrorStore::new();
-
     match &input.data {
         Data::Enum(_) => {
             // Implement all Enums as `Leaf`s
             let (out, errors) = make_leaf(&input, AttrPosition::Enum);
             DeriveDiffableOutput {
                 out: Some(out),
-                errors: errors.into_iter().collect::<Vec<_>>(),
+                errors: errors.into_iter().collect(),
             }
         }
-        Data::Struct(s) => {
-            // This might be None if there are errors.
-            let out = make_struct_impl(&input, s, error_store.sink());
-            DeriveDiffableOutput { out, errors: error_store.into_inner() }
-        }
+        Data::Struct(s) => match make_struct_impl(&input, s) {
+            (None, None) => DeriveDiffableOutput {
+                out: None,
+                errors: vec![syn::Error::new(
+                    Span::call_site(),
+                    "Internal daft error, no code and no errors produced",
+                )],
+            },
+            (out, errors) => DeriveDiffableOutput {
+                out,
+                errors: errors.into_iter().collect(),
+            },
+        },
 
         Data::Union(_) => {
             // Implement all unions as `Leaf`s
             let (out, errors) = make_leaf(&input, AttrPosition::Union);
             DeriveDiffableOutput {
                 out: Some(out),
-                errors: errors.into_iter().collect::<Vec<_>>(),
+                errors: errors.into_iter().collect(),
             }
         }
     }
@@ -123,7 +128,7 @@ fn make_leaf(
     input: &DeriveInput,
     position: AttrPosition,
 ) -> (TokenStream, Option<syn::Error>) {
-    let mut errors = ErrorParty::new();
+    let mut warnings = ErrorParty::new();
     // The input should not have any daft attributes.
     for attr in &input.attrs {
         if attr.path().is_ident("daft") {
@@ -134,13 +139,13 @@ fn make_leaf(
                         return Ok(());
                     }
 
-                    errors.push(meta.error(format!(
+                    warnings.push(meta.error(format!(
                         "this is unnecessary: the Diffable \
                          implementation {} is always a leaf",
                         position.as_purpose_str(),
                     )));
                 } else {
-                    errors.push(meta.error(format!(
+                    warnings.push(meta.error(format!(
                         "daft attributes are not allowed {}",
                         position.as_locative_str(),
                     )));
@@ -149,7 +154,7 @@ fn make_leaf(
                 Ok(())
             });
             if let Err(err) = res {
-                errors.push(err);
+                warnings.push(err);
             }
         }
     }
@@ -158,7 +163,7 @@ fn make_leaf(
     let mut v = BanDaftAttrsVisitor { position, errors: ErrorParty::new() };
     v.visit_data(&input.data);
     if let Some(error) = v.errors.first_to_syn() {
-        errors.push(error);
+        warnings.push(error);
     }
 
     // Even though errors might have occurred above, we *do* generate the
@@ -185,7 +190,7 @@ fn make_leaf(
                 }
             }
         },
-        errors.first_to_syn(),
+        warnings.first_to_syn(),
     )
 }
 
@@ -299,8 +304,7 @@ impl AttrPosition {
 fn make_struct_impl(
     input: &DeriveInput,
     s: &DataStruct,
-    errors: ErrorSink<'_, syn::Error>,
-) -> Option<TokenStream> {
+) -> (Option<TokenStream>, Option<syn::Error>) {
     match StructConfig::parse_from(&input.attrs).map(|config| config.mode) {
         Ok(StructMode::Default) => {
             match make_diff_struct(input, s).map(
@@ -315,24 +319,15 @@ fn make_struct_impl(
                     }
                 },
             ) {
-                Ok(stream) => Some(stream),
-                Err(error) => {
-                    errors.new_child().push(error);
-                    None
-                }
+                Ok(stream) => (Some(stream), None),
+                Err(error) => (None, Some(error)),
             }
         }
         Ok(StructMode::Leaf) => {
             let (out, error) = make_leaf(input, AttrPosition::LeafStruct);
-            if let Some(error) = error {
-                errors.new_child().push(error);
-            }
-            Some(out)
+            (Some(out), error)
         }
-        Err(error) => {
-            errors.new_child().push(error);
-            None
-        }
+        Err(error) => (None, Some(error)),
     }
 }
 
